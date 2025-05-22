@@ -1,0 +1,14 @@
+{
+    "name": "faac-wasm",
+    "version": "1.0.0",
+    "description": "FAAC WebAssembly build",
+    "main": "dist/libfaac.js",
+    "author": "Dmitry Zlygin <dzlygin@gmail.com>",
+    "license": "MIT",
+    "scripts": {
+        "start": "npx serve .",
+        "build": "git submodule update --init --recursive && bash build_wasm.sh",
+        "clean": "rm -rf wasm_build faac",
+        "clean-all": "npm run clean && rm -rf dist"
+    }
+}

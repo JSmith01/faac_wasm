@@ -1,0 +1,3 @@
+[submodule "faac"]
+	path = faac
+	url = git@github.com:knik0/faac.git

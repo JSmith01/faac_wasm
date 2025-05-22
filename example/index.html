@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FAAC WebAssembly Mic Recording Example (Mono)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .recording {
+            background-color: #ff4c4c;
+            color: white;
+        }
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f0f0f0;
+            border-radius: 5px;
+        }
+        #visualizer {
+            width: 100%;
+            height: 100px;
+            background-color: #f0f0f0;
+            margin: 20px 0;
+        }
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>FAAC WebAssembly Mic Recording Example (Mono)</h1>
+    
+    <div id="status">Status: Ready</div>
+    
+    <canvas id="visualizer"></canvas>
+    
+    <div class="controls">
+        <button id="recordButton">Start Recording</button>
+        <button id="stopButton" disabled>Stop Recording</button>
+        <button id="downloadButton" disabled>Download AAC</button>
+        <button id="downloadRawButton" disabled>Download Raw PCM</button>
+    </div>
+    
+    <h2>Instructions:</h2>
+    <ol>
+        <li>Click "Start Recording" to begin capturing audio from your microphone</li>
+        <li>Speak into your microphone</li>
+        <li>Click "Stop Recording" when finished</li>
+        <li>Click "Download AAC" to download the encoded AAC file</li>
+        <li>If the AAC file still sounds distorted, click "Download Raw PCM" to get the raw audio data for debugging</li>
+    </ol>
+
+    <script>
+        // First, load the FAAC WebAssembly module
+        const faacWasmPath = '../dist/libfaac.js';
+        
+        // Dynamic script loading for the WASM module
+        const script = document.createElement('script');
+        script.src = faacWasmPath;
+        script.async = true;
+        document.head.appendChild(script);
+        
+        // Global variables
+        let audioContext;
+        let mediaStream;
+        let recorder;
+        let isRecording = false;
+        let recordedChunks = [];
+        let rawPcmSamples = [];  // Store raw PCM for debugging
+        let faacModule;
+        let faacHandle;
+        let visualizerCanvas;
+        let canvasContext;
+        let analyser;
+        let aacOutputBytes = [];
+        let maxOutputBytes = 0;
+        
+        // FAAC constants from faaccfg.h
+        const MPEG4 = 0;
+        const LOW = 2;  // AAC LC object type
+        const FAAC_INPUT_16BIT = 1;
+        const ADTS_STREAM = 1;
+        
+        // Sample rate and channels configuration - switched to mono
+        const sampleRate = 48000;  // Standard audio sample rate
+        const channels = 1;  // Mono recording
+        const inputSamples = 1024; // Smaller buffer size for better encoding
+        
+        // Wait for the FAAC module to load
+        script.onload = async () => {
+            try {
+                updateStatus("Loading FAAC WebAssembly module...");
+                faacModule = await FAAC();
+                updateStatus("FAAC WebAssembly module loaded successfully!");
+                console.log("FAAC Module Structure:", Object.keys(faacModule));
+                
+                // Initialize FAAC wrapper functions
+                initFaacFunctions();
+            } catch (error) {
+                updateStatus("Error loading FAAC module: " + error.message);
+                console.error("Error loading FAAC module:", error);
+            }
+        };
+        
+        // Initialize UI elements and event handlers
+        document.addEventListener('DOMContentLoaded', () => {
+            const recordButton = document.getElementById('recordButton');
+            const stopButton = document.getElementById('stopButton');
+            const downloadButton = document.getElementById('downloadButton');
+            const downloadRawButton = document.getElementById('downloadRawButton');
+            visualizerCanvas = document.getElementById('visualizer');
+            canvasContext = visualizerCanvas.getContext('2d');
+            
+            recordButton.addEventListener('click', startRecording);
+            stopButton.addEventListener('click', stopRecording);
+            downloadButton.addEventListener('click', downloadAAC);
+            downloadRawButton.addEventListener('click', downloadRawPCM);
+        });
+        
+        // Initialize FAAC functions using the WebAssembly module
+        function initFaacFunctions() {
+            try {
+                // Wrap the FAAC C functions for use in JavaScript
+                window.faacEncOpen = faacModule.cwrap('faacEncOpen', 'number', ['number', 'number', 'number', 'number']);
+                window.faacEncGetCurrentConfiguration = faacModule.cwrap('faacEncGetCurrentConfiguration', 'number', ['number']);
+                window.faacEncSetConfiguration = faacModule.cwrap('faacEncSetConfiguration', 'number', ['number', 'number']);
+                window.faacEncEncode = faacModule.cwrap('faacEncEncode', 'number', ['number', 'number', 'number', 'number', 'number']);
+                window.faacEncClose = faacModule.cwrap('faacEncClose', 'number', ['number']);
+                window.faacEncGetVersion = faacModule.cwrap('faacEncGetVersion', 'number', []);
+                window.faacEncGetDecoderSpecificInfo = faacModule.cwrap('faacEncGetDecoderSpecificInfo', 'number', ['number', 'number', 'number']);
+                
+                // Test memory functions and log results
+                const testPtr = faacModule._malloc(4);
+                console.log("Test allocation:", testPtr);
+                if (testPtr) {
+                    faacModule.setValue(testPtr, 42, 'i32');
+                    const testVal = faacModule.getValue(testPtr, 'i32');
+                    console.log("Test memory read/write:", testVal);
+                    faacModule._free(testPtr);
+                }
+                
+                // Get FAAC version
+                const versionPtr = faacEncGetVersion();
+                if (versionPtr) {
+                    const version = faacModule.UTF8ToString(versionPtr);
+                    updateStatus("FAAC Version: " + version);
+                }
+            } catch (error) {
+                updateStatus("Error initializing FAAC functions: " + error.message);
+                console.error("Error initializing FAAC functions:", error);
+            }
+        }
+        
+        // Start recording from the microphone
+        async function startRecording() {
+            if (isRecording || !faacModule) return;
+            
+            try {
+                updateStatus("Requesting microphone access...");
+                
+                // Request microphone access with specific constraints - now using mono
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        channelCount: channels, // Mono channel
+                        sampleRate: sampleRate,
+                        echoCancellation: false,
+                        autoGainControl: false,
+                        noiseSuppression: false
+                    } 
+                });
+                
+                // Create AudioContext with exact sample rate
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: sampleRate,
+                    latencyHint: "interactive"
+                });
+                
+                console.log("Audio context sample rate:", audioContext.sampleRate);
+                
+                // Create analyzer for visualizer
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                
+                // Create source from media stream
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                source.connect(analyser);
+                
+                // Set up the FAAC encoder
+                if (!setupFaacEncoder()) {
+                    throw new Error("Failed to set up FAAC encoder");
+                }
+                
+                // Start recording
+                isRecording = true;
+                recordedChunks = [];
+                rawPcmSamples = [];
+                aacOutputBytes = [];
+                
+                // Set up audio processing - using mono channels now
+                const processor = audioContext.createScriptProcessor(inputSamples, channels, channels);
+                processor.onaudioprocess = processAudioData;
+                analyser.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                // Start visualizer
+                drawVisualizer();
+                
+                // Update UI
+                document.getElementById('recordButton').classList.add('recording');
+                document.getElementById('recordButton').disabled = true;
+                document.getElementById('stopButton').disabled = false;
+                document.getElementById('downloadButton').disabled = true;
+                document.getElementById('downloadRawButton').disabled = true;
+                
+                updateStatus("Recording... Speak into the microphone");
+            } catch (error) {
+                updateStatus("Error starting recording: " + error.message);
+                console.error("Error starting recording:", error);
+            }
+        }
+        
+        // Set up the FAAC encoder
+        function setupFaacEncoder() {
+            try {
+                console.log("Setting up FAAC encoder...");
+                
+                // Create input sample size and max output bytes pointers
+                const inputSamplesPtr = faacModule._malloc(4);
+                if (!inputSamplesPtr) {
+                    throw new Error("Failed to allocate memory for inputSamples");
+                }
+                
+                const maxOutputBytesPtr = faacModule._malloc(4);
+                if (!maxOutputBytesPtr) {
+                    faacModule._free(inputSamplesPtr);
+                    throw new Error("Failed to allocate memory for maxOutputBytes");
+                }
+                
+                // Set the input samples value
+                faacModule.setValue(inputSamplesPtr, inputSamples, 'i32');
+                
+                console.log(`Calling faacEncOpen with: sampleRate=${sampleRate}, channels=${channels}, inputSamplesPtr=${inputSamplesPtr}, maxOutputBytesPtr=${maxOutputBytesPtr}`);
+                
+                // Open FAAC encoder with mono channels
+                faacHandle = faacEncOpen(sampleRate, channels, inputSamplesPtr, maxOutputBytesPtr);
+                
+                if (!faacHandle) {
+                    faacModule._free(inputSamplesPtr);
+                    faacModule._free(maxOutputBytesPtr);
+                    throw new Error("faacEncOpen failed to return a valid handle");
+                }
+                
+                console.log("FAAC handle:", faacHandle);
+                
+                // Read the max output bytes that FAAC needs
+                maxOutputBytes = faacModule.getValue(maxOutputBytesPtr, 'i32');
+                console.log("Max output bytes:", maxOutputBytes);
+                
+                // Free memory
+                faacModule._free(inputSamplesPtr);
+                faacModule._free(maxOutputBytesPtr);
+                
+                // Get current configuration and optimize it
+                const configPtr = faacEncGetCurrentConfiguration(faacHandle);
+                
+                if (!configPtr) {
+                    throw new Error("faacEncGetCurrentConfiguration failed");
+                }
+                
+                console.log("Configuration pointer:", configPtr);
+                
+                // The faacEncConfiguration struct layout (based on faaccfg.h):
+                // Field                Offset (bytes)   Type
+                // version              0                int
+                // name                 4                char*
+                // copyright            8                char*
+                // mpegVersion          12               unsigned int
+                // aacObjectType        16               unsigned int
+                // jointmode/allowMidside 20             unsigned int
+                // useLfe               24               unsigned int
+                // useTns               28               unsigned int
+                // bitRate              32               unsigned long
+                // bandWidth            36               unsigned int
+                // quantqual            40               unsigned long
+                // outputFormat         44               unsigned int
+                // psymodellist         48               psymodellist_t*
+                // psymodelidx          52               unsigned int
+                // inputFormat          56               unsigned int
+                // shortctl             60               int
+                
+                // Set MPEG version to MPEG4
+                faacModule.setValue(configPtr + 12, MPEG4, 'i32');
+                
+                // Set AAC object type to LOW (AAC-LC)
+                faacModule.setValue(configPtr + 16, LOW, 'i32');
+                
+                // Joint stereo coding not needed for mono
+                faacModule.setValue(configPtr + 20, 0, 'i32');
+                
+                // Enable TNS
+                faacModule.setValue(configPtr + 28, 1, 'i32');
+                
+                // Set bitrate - using 64kbps for mono
+                faacModule.setValue(configPtr + 32, 64000, 'i32');
+                
+                // Set bandwidth - 0 means full bandwidth
+                faacModule.setValue(configPtr + 36, 0, 'i32');
+                
+                // Set quality - higher is better (0-100)
+                faacModule.setValue(configPtr + 40, 100, 'i32');
+                
+                // Set output format to ADTS
+                faacModule.setValue(configPtr + 44, ADTS_STREAM, 'i32');
+                
+                // Set input format to 16-bit
+                faacModule.setValue(configPtr + 56, FAAC_INPUT_16BIT, 'i32');
+                
+                // Apply the configuration
+                console.log("Setting encoder configuration");
+                const result = faacEncSetConfiguration(faacHandle, configPtr);
+                
+                if (result === 0) {
+                    throw new Error("faacEncSetConfiguration failed");
+                }
+                
+                console.log("FAAC encoder setup successful");
+                return true;
+            } catch (error) {
+                updateStatus("Error setting up FAAC encoder: " + error.message);
+                console.error("Error setting up FAAC encoder:", error);
+                return false;
+            }
+        }
+        
+        // Process audio data from microphone - updated for mono
+        function processAudioData(e) {
+            if (!isRecording || !faacHandle) return;
+            
+            // Get audio data from mono channel
+            const monoChannel = e.inputBuffer.getChannelData(0);
+            
+            // Convert float audio samples to 16-bit PCM samples (mono)
+            const pcmSamples = new Int16Array(monoChannel.length);
+            for (let i = 0; i < monoChannel.length; i++) {
+                // Mono channel - clamp to [-1, 1] and scale to [-32768, 32767]
+                pcmSamples[i] = Math.max(-1, Math.min(1, monoChannel[i])) * 0x7FFF;
+            }
+            
+            // Store raw PCM for debugging
+            rawPcmSamples.push(...Array.from(pcmSamples));
+            
+            // Encode PCM to AAC using FAAC
+            encodePCMChunk(pcmSamples);
+        }
+        
+        // Encode a chunk of PCM audio to AAC
+        function encodePCMChunk(pcmSamples) {
+            try {
+                // Allocate memory for input PCM samples
+                const pcmBufferSize = pcmSamples.length * 2; // 2 bytes per sample (16-bit)
+                const pcmBufferPtr = faacModule._malloc(pcmBufferSize);
+                
+                if (!pcmBufferPtr) {
+                    throw new Error("Failed to allocate memory for PCM buffer");
+                }
+                
+                // Create a view to the heap memory for PCM data
+                try {
+                    // Try using HEAP16 if available after rebuilding
+                    if (faacModule.HEAP16) {
+                        const pcmView = new Int16Array(faacModule.HEAP16.buffer, pcmBufferPtr, pcmSamples.length);
+                        pcmView.set(pcmSamples);
+                    } else {
+                        // Fallback to byte-by-byte copying with setValue
+                        for (let i = 0; i < pcmSamples.length; i++) {
+                            // Write as little-endian (low byte first, high byte second)
+                            const value = pcmSamples[i];
+                            faacModule.setValue(pcmBufferPtr + i * 2, value & 0xFF, 'i8');        // Low byte
+                            faacModule.setValue(pcmBufferPtr + i * 2 + 1, (value >> 8) & 0xFF, 'i8'); // High byte
+                        }
+                    }
+                } catch (e) {
+                    console.error("Error copying PCM data:", e);
+                    // Fallback to byte-by-byte copying with setValue
+                    for (let i = 0; i < pcmSamples.length; i++) {
+                        // Write as little-endian (low byte first, high byte second)
+                        const value = pcmSamples[i];
+                        faacModule.setValue(pcmBufferPtr + i * 2, value & 0xFF, 'i8');        // Low byte
+                        faacModule.setValue(pcmBufferPtr + i * 2 + 1, (value >> 8) & 0xFF, 'i8'); // High byte
+                    }
+                }
+                
+                // Allocate memory for output AAC data
+                const outputBufferPtr = faacModule._malloc(maxOutputBytes);
+                
+                if (!outputBufferPtr) {
+                    faacModule._free(pcmBufferPtr);
+                    throw new Error("Failed to allocate memory for output buffer");
+                }
+                
+                // Encode the PCM data to AAC
+                const bytesEncoded = faacEncEncode(
+                    faacHandle,
+                    pcmBufferPtr,
+                    pcmSamples.length, // For mono, this is the number of samples
+                    outputBufferPtr,
+                    maxOutputBytes
+                );
+                
+                console.log(`Encoded ${pcmSamples.length} samples to ${bytesEncoded} bytes of AAC`);
+                
+                // If we got encoded data, copy it
+                if (bytesEncoded > 0) {
+                    // Read the encoded data
+                    const encodedData = new Uint8Array(bytesEncoded);
+                    for (let i = 0; i < bytesEncoded; i++) {
+                        encodedData[i] = faacModule.getValue(outputBufferPtr + i, 'i8') & 0xFF;
+                    }
+                    
+                    // Add to our AAC output stream
+                    aacOutputBytes.push(...encodedData);
+                }
+                
+                // Free allocated memory
+                faacModule._free(pcmBufferPtr);
+                faacModule._free(outputBufferPtr);
+            } catch (error) {
+                console.error("Error encoding PCM chunk:", error);
+            }
+        }
+        
+        // Draw audio visualizer
+        function drawVisualizer() {
+            if (!isRecording) return;
+            
+            requestAnimationFrame(drawVisualizer);
+            
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+            
+            canvasContext.fillStyle = 'rgb(200, 200, 200)';
+            canvasContext.fillRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+            
+            canvasContext.lineWidth = 2;
+            canvasContext.strokeStyle = 'rgb(0, 0, 0)';
+            canvasContext.beginPath();
+            
+            const sliceWidth = visualizerCanvas.width * 1.0 / bufferLength;
+            let x = 0;
+            
+            for (let i = 0; i < bufferLength; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = v * visualizerCanvas.height / 2;
+                
+                if (i === 0) {
+                    canvasContext.moveTo(x, y);
+                } else {
+                    canvasContext.lineTo(x, y);
+                }
+                
+                x += sliceWidth;
+            }
+            
+            canvasContext.lineTo(visualizerCanvas.width, visualizerCanvas.height / 2);
+            canvasContext.stroke();
+        }
+        
+        // Stop recording
+        function stopRecording() {
+            if (!isRecording) return;
+            
+            isRecording = false;
+            
+            // Stop media stream
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            
+            // Close audio context
+            if (audioContext) {
+                audioContext.close();
+            }
+            
+            // Close FAAC encoder
+            if (faacHandle) {
+                faacEncClose(faacHandle);
+                faacHandle = null;
+            }
+            
+            // Update UI
+            document.getElementById('recordButton').classList.remove('recording');
+            document.getElementById('recordButton').disabled = false;
+            document.getElementById('stopButton').disabled = true;
+            document.getElementById('downloadButton').disabled = false;
+            document.getElementById('downloadRawButton').disabled = false;
+            
+            updateStatus("Recording stopped. " + aacOutputBytes.length + " bytes of AAC data generated.");
+        }
+        
+        // Download AAC file
+        function downloadAAC() {
+            if (aacOutputBytes.length === 0) {
+                updateStatus("No AAC data available to download.");
+                return;
+            }
+            
+            // Create Blob from AAC bytes
+            const aacBlob = new Blob([new Uint8Array(aacOutputBytes)], { type: 'audio/aac' });
+            
+            // Create download link
+            const url = URL.createObjectURL(aacBlob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = 'recording.aac';
+            document.body.appendChild(a);
+            
+            // Trigger download
+            a.click();
+            
+            // Clean up
+            setTimeout(() => {
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+            }, 100);
+            
+            updateStatus("AAC file downloaded.");
+        }
+        
+        // Download raw PCM for debugging
+        function downloadRawPCM() {
+            if (rawPcmSamples.length === 0) {
+                updateStatus("No PCM data available to download.");
+                return;
+            }
+            
+            // Convert Int16Array to ArrayBuffer
+            const buffer = new ArrayBuffer(rawPcmSamples.length * 2);
+            const view = new DataView(buffer);
+            
+            // Write the PCM data as little-endian 16-bit samples
+            for (let i = 0; i < rawPcmSamples.length; i++) {
+                view.setInt16(i * 2, rawPcmSamples[i], true); // true = little-endian
+            }
+            
+            const wavBlob = createWavFile(buffer, channels, sampleRate);
+            
+            // Create download link
+            const url = URL.createObjectURL(wavBlob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = 'recording_raw.wav';
+            document.body.appendChild(a);
+            
+            // Trigger download
+            a.click();
+            
+            // Clean up
+            setTimeout(() => {
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+            }, 100);
+            
+            updateStatus("Raw PCM data downloaded as WAV file.");
+        }
+        
+        // Create a WAV file from PCM data - updated for mono
+        function createWavFile(pcmBuffer, numChannels, sampleRate) {
+            const bytesPerSample = 2;
+            
+            // Create WAV header
+            const headerBuffer = new ArrayBuffer(44);
+            const headerView = new DataView(headerBuffer);
+            
+            // RIFF identifier
+            writeString(headerView, 0, 'RIFF');
+            // File length (will be filled in later)
+            headerView.setUint32(4, 36 + pcmBuffer.byteLength, true);
+            // RIFF type
+            writeString(headerView, 8, 'WAVE');
+            // Format chunk identifier
+            writeString(headerView, 12, 'fmt ');
+            // Format chunk length
+            headerView.setUint32(16, 16, true);
+            // Sample format (1 = PCM)
+            headerView.setUint16(20, 1, true);
+            // Channel count (mono = 1)
+            headerView.setUint16(22, numChannels, true);
+            // Sample rate
+            headerView.setUint32(24, sampleRate, true);
+            // Byte rate (SampleRate * NumChannels * BitsPerSample/8)
+            headerView.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+            // Block align (NumChannels * BitsPerSample/8)
+            headerView.setUint16(32, numChannels * bytesPerSample, true);
+            // Bits per sample
+            headerView.setUint16(34, 8 * bytesPerSample, true);
+            // Data chunk identifier
+            writeString(headerView, 36, 'data');
+            // Data chunk length
+            headerView.setUint32(40, pcmBuffer.byteLength, true);
+            
+            // Combine the header and PCM data
+            const wavBuffer = new Uint8Array(headerBuffer.byteLength + pcmBuffer.byteLength);
+            wavBuffer.set(new Uint8Array(headerBuffer), 0);
+            wavBuffer.set(new Uint8Array(pcmBuffer), headerBuffer.byteLength);
+            
+            return new Blob([wavBuffer], { type: 'audio/wav' });
+        }
+        
+        // Helper to write strings to DataView
+        function writeString(dataView, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                dataView.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+        
+        // Update status display
+        function updateStatus(message) {
+            const statusElement = document.getElementById('status');
+            statusElement.textContent = "Status: " + message;
+            console.log(message);
+        }
+    </script>
+</body>
+</html>
