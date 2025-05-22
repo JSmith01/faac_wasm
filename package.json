@@ -9,6 +9,6 @@
         "start": "npx serve .",
         "build": "git submodule update --init --recursive && bash build_wasm.sh",
         "clean": "rm -rf wasm_build faac",
-        "clean-all": "npm run clean && rm -rf dist"
+        "clean-all": "npm run clean && rm dist/libfaac.js && rm -rf dist/libfaac.wasm"
     }
 }
