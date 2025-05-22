@@ -1,7 +1,6 @@
-# FAAC WASM build
+# FAAC (AAC encoder) WASM build and demo
 
-Compiles FAAC to WASM with emscripten. Has to be cloned with Linux-style line endings (otherwise compilation fails). Linux needs `automake`, `automake`, and `libtool` to be installed, and emscripten env vars
-have to be initialized before starting a build.
+Compiles FAAC (freeware AAC encoder) to WASM with emscripten. Has to be cloned with Linux-style line endings (otherwise compilation fails). Linux needs `automake`, `automake`, and `libtool` to be installed, and emscripten env vars have to be initialized before starting a build.
 
 To start a build:
 ```bash
